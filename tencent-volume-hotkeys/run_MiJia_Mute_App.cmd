@@ -1,0 +1,1 @@
+start    /b  ""  ".\.venv\Scripts\pythonw.exe"    ".\tencent_volume_keys.py"
