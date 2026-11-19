@@ -27,10 +27,11 @@ pip install pycaw comtypes psutil
 
 ## 运行
 
-双击 `启动.bat`（不显示控制台窗口），或：
+双击 `run_MiJia_Mute_App.cmd`（或其快捷方式），程序会**直接最小化到系统托盘**，不弹主窗口；也可以在命令行运行：
 
 ```
-pythonw tencent_volume_keys.py
+pythonw tencent_volume_keys.py --minimized   # 同上：启动后只留托盘图标
+pythonw tencent_volume_keys.py               # 需要看主窗口时用这个
 ```
 
 首次运行会自动识别腾讯应用引擎并把它设为目标。如果列表里没有它，先启动引擎并让它出点声音（音频会话只在应用发声音时才存在），再点「刷新列表」，选中 `AndrowsVm.exe` 后点「设为快捷键目标」。
