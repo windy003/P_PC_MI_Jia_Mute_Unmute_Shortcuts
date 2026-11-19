@@ -50,7 +50,7 @@ pythonw tencent_volume_keys.py
 - 快捷键被其他程序占用时，「保存并应用」会弹窗提示，换一组组合键即可
 - 配置文件：`%APPDATA%\TencentAppVolumeKeys\config.json`
 - 日志：`%APPDATA%\TencentAppVolumeKeys\app.log`
-- 自检：`python tencent_volume_keys.py --selftest`
+- 自检：`python selftest.py`（测试代码单独放在 `selftest.py`，主程序里不包含测试）
 
 ## 打包成 exe（可选）
 
