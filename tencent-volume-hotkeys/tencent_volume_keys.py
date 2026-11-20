@@ -660,6 +660,120 @@ class HotkeyRecorder(tk.Toplevel):
         self.on_done(text)
 
 
+# ---------------------------------------------------------------- 屏幕提示
+
+class Toast:
+    """屏幕底部居中的短暂文字提示（类似音量 OSD）。
+
+    窗口置顶、无边框、不抢焦点，显示一小会儿后淡出。
+    """
+
+    BG = "#1f1f1f"
+    FG = "#ffffff"
+    WS_EX_NOACTIVATE = 0x08000000
+    WS_EX_TOOLWINDOW = 0x00000080
+    GWL_EXSTYLE = -20
+    DWMWA_WINDOW_CORNER_PREFERENCE = 33
+    DWMWCP_ROUND = 2
+
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.win = None
+        self.label = None
+        self._hide_job = None
+        self._fade_job = None
+
+    # -- 对外 ------------------------------------------------------------
+    def show(self, text: str, duration_ms: int = 1600) -> None:
+        try:
+            if self.win is None or not self.win.winfo_exists():
+                self._build()
+            self._cancel_jobs()
+            self.label.configure(text=text)
+            self.win.attributes("-alpha", 1.0)
+            self.win.deiconify()
+            self._place()
+            self.win.lift()
+            self._hide_job = self.root.after(duration_ms, self._fade_out)
+        except tk.TclError:
+            log("toast show failed:\n" + traceback.format_exc())
+
+    def close(self) -> None:
+        self._cancel_jobs()
+        if self.win is not None:
+            try:
+                self.win.destroy()
+            except tk.TclError:
+                pass
+            self.win = None
+
+    # -- 内部 ------------------------------------------------------------
+    def _build(self) -> None:
+        win = tk.Toplevel(self.root)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.configure(bg=self.BG)
+        self.label = tk.Label(win, text="", font=("Microsoft YaHei UI", 12),
+                              fg=self.FG, bg=self.BG, padx=24, pady=12)
+        self.label.pack()
+        self.win = win
+        win.update_idletasks()
+        self._make_noactivate(win)
+        win.withdraw()
+
+    def _make_noactivate(self, win: tk.Toplevel) -> None:
+        """让提示窗口不抢输入焦点，也不出现在任务栏 / Alt+Tab 里。"""
+        try:
+            hwnd = user32.GetParent(win.winfo_id()) or win.winfo_id()
+            style = user32.GetWindowLongW(hwnd, self.GWL_EXSTYLE)
+            user32.SetWindowLongW(
+                hwnd, self.GWL_EXSTYLE,
+                style | self.WS_EX_NOACTIVATE | self.WS_EX_TOOLWINDOW)
+        except (AttributeError, OSError):
+            pass
+        try:  # Windows 11：圆角（不支持时静默忽略）
+            dwmapi = ctypes.WinDLL("dwmapi")
+            preference = ctypes.c_int(self.DWMWCP_ROUND)
+            dwmapi.DwmSetWindowAttribute(
+                hwnd, self.DWMWA_WINDOW_CORNER_PREFERENCE,
+                ctypes.byref(preference), ctypes.sizeof(preference))
+        except (AttributeError, OSError):
+            pass
+
+    def _place(self) -> None:
+        self.win.update_idletasks()
+        width = self.win.winfo_width()
+        height = self.win.winfo_height()
+        screen_w = self.win.winfo_screenwidth()
+        screen_h = self.win.winfo_screenheight()
+        margin = max(72, int(screen_h * 0.12))
+        x = (screen_w - width) // 2
+        y = screen_h - height - margin
+        self.win.geometry(f"+{max(0, x)}+{max(0, y)}")
+
+    def _fade_out(self) -> None:
+        self._hide_job = None
+        try:
+            alpha = float(self.win.attributes("-alpha")) - 0.12
+            if alpha <= 0.05:
+                self.win.withdraw()
+                return
+            self.win.attributes("-alpha", alpha)
+            self._fade_job = self.root.after(28, self._fade_out)
+        except tk.TclError:
+            pass
+
+    def _cancel_jobs(self) -> None:
+        for job in (self._hide_job, self._fade_job):
+            if job is not None:
+                try:
+                    self.root.after_cancel(job)
+                except tk.TclError:
+                    pass
+        self._hide_job = None
+        self._fade_job = None
+
+
 # ---------------------------------------------------------------- 主界面
 
 class App:
@@ -675,6 +789,7 @@ class App:
         self._ui_queue = queue.Queue()
         self._tray_hint_shown = False
         self.tray = None
+        self.toast = Toast(root)
 
         self._prepare_fonts()
         self._build_ui()
@@ -852,23 +967,30 @@ class App:
     def _on_mute_result(self, result, error):
         if error is not None:
             log(f"mute error: {error!r}")
-            self._status(f"切换静音失败：{error}")
+            self._notify(f"切换静音失败：{error}", "切换静音失败")
             return
         if not result or not result.get("ok"):
             reason = (result or {}).get("reason")
             if reason == "no_session":
                 exe = (result or {}).get("exe") or TARGET_EXE
-                self._status(f"没找到 {exe} 的音频会话：引擎可能没在播放声音，"
-                             f"或者已经退出。")
+                self._notify(f"没找到 {exe} 的音频会话：引擎可能没在播放声音，"
+                             f"或者已经退出。",
+                             f"没找到 {exe} 的音频会话")
             else:
-                self._status("切换静音失败（未知原因）。")
+                self._notify("切换静音失败（未知原因）。", "切换静音失败")
             return
         muted = bool(result.get("muted"))
         percent = round(float(result.get("volume") or 0.0) * 100)
         if muted:
-            self._status(f"已静音 · {result.get('exe', '')}")
+            self._notify(f"已静音 · {result.get('exe', '')}", "已静音")
         else:
-            self._status(f"已恢复声音 · {percent}% · {result.get('exe', '')}")
+            self._notify(f"已恢复声音 · {percent}% · {result.get('exe', '')}",
+                         f"已恢复声音 · {percent}%")
+
+    def _notify(self, status_text: str, toast_text: str | None = None) -> None:
+        """同时更新主窗口状态栏和屏幕顶部提示。"""
+        self._status(status_text)
+        self.toast.show(toast_text or status_text)
 
     # -- 热键分发 / 计时器 -------------------------------------------------
     def _on_hotkey(self, action: str):
@@ -975,6 +1097,7 @@ class App:
         if self.tray is not None:
             self.tray.stop()
             self.tray = None
+        self.toast.close()
         self.audio.stop()
         try:
             self.root.destroy()
