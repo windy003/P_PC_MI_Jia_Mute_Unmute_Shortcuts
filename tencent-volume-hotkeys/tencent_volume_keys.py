@@ -3,8 +3,8 @@
 腾讯应用引擎 · 音量开关
 ======================
 
-只做一件事：用一个可自定义的全局快捷键，给「腾讯应用引擎」（AndrowsVm.exe）
-开 / 关声音（静音切换）。
+用可自定义的全局快捷键给「腾讯应用引擎」（AndrowsVm.exe）开 / 关声音
+（静音切换），以及按 5% 一步加减音量。
 
 音量通过 Windows Core Audio API 的「每个应用独立音量」控制（就是系统音量合成器里
 那一列），只影响目标应用，不影响其他程序。
@@ -53,10 +53,17 @@ CONFIG_DIR = Path(os.environ.get("APPDATA") or Path.home()) / APP_ID
 CONFIG_FILE = CONFIG_DIR / "config.json"
 LOG_FILE = CONFIG_DIR / "app.log"
 
-ACTION_ORDER = ("mute",)
-ACTION_LABELS = {"mute": "音量开关"}
+ACTION_ORDER = ("mute", "up", "down")
+ACTION_LABELS = {"mute": "音量开关", "up": "音量 +", "down": "音量 −"}
 
-DEFAULT_HOTKEYS = {"mute": "ctrl+alt+m"}
+DEFAULT_HOTKEYS = {
+    "mute": "ctrl+alt+m",
+    "up": "ctrl+alt+up",
+    "down": "ctrl+alt+down",
+}
+
+# 每次按音量快捷键调整的幅度
+VOLUME_STEP = 0.05
 
 DEFAULT_CONFIG = {
     "hotkeys": dict(DEFAULT_HOTKEYS),
@@ -530,10 +537,13 @@ class AudioWorker(threading.Thread):
     def list_sessions(self):
         return [info for _, info in self.scan()]
 
-    # -- 静音开关 --------------------------------------------------------
+    # -- 静音 / 音量 ------------------------------------------------------
+    def _targets(self):
+        return [(session, info) for session, info in self.scan()
+                if info["exe"] == TARGET_EXE]
+
     def toggle_mute(self):
-        matches = [(session, info) for session, info in self.scan()
-                   if info["exe"] == TARGET_EXE]
+        matches = self._targets()
         if not matches:
             return {"ok": False, "reason": "no_session", "exe": TARGET_EXE}
 
@@ -550,6 +560,28 @@ class AudioWorker(threading.Thread):
             raise last_error or RuntimeError("无法设置静音")
         return {"ok": True, "volume": matches[0][1]["volume"],
                 "muted": new_muted, "exe": TARGET_EXE}
+
+    def adjust_volume(self, delta: float):
+        """在当前音量基础上加减 delta（0~1 之间的比例），不改变静音状态。"""
+        matches = self._targets()
+        if not matches:
+            return {"ok": False, "reason": "no_session", "exe": TARGET_EXE}
+
+        base = max(info["volume"] for _, info in matches)
+        new_volume = min(1.0, max(0.0, base + delta))
+        done = 0
+        last_error = None
+        for session, _info in matches:
+            try:
+                session.SimpleAudioVolume.SetMasterVolume(new_volume, None)
+                done += 1
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+        if done == 0:
+            raise last_error or RuntimeError("无法设置音量")
+        return {"ok": True, "volume": new_volume,
+                "muted": all(info["muted"] for _, info in matches),
+                "exe": TARGET_EXE}
 
 
 # ---------------------------------------------------------------- 系统托盘
@@ -835,17 +867,24 @@ class App:
         # 快捷键
         hotkey_box = ttk.LabelFrame(outer, text=" 快捷键 ", padding=8)
         hotkey_box.grid(row=1, column=0, sticky="ew", pady=(10, 0))
-        ttk.Label(hotkey_box, text=ACTION_LABELS["mute"],
-                  width=14).grid(row=0, column=0, sticky="w", pady=2)
-        self.hotkey_var = tk.StringVar()
-        ttk.Entry(hotkey_box, textvariable=self.hotkey_var, width=26,
-                  state="readonly").grid(row=0, column=1, sticky="w", pady=2)
-        ttk.Button(hotkey_box, text="录制", width=8,
-                   command=self._record_hotkey).grid(row=0, column=2,
-                                                     padx=(8, 0), pady=2)
-        ttk.Label(hotkey_box, text="按一次静音，再按一次恢复声音",
-                  foreground="#777777").grid(row=1, column=0, columnspan=3,
-                                             sticky="w", pady=(6, 0))
+        self.hotkey_vars = {}
+        for row, action in enumerate(ACTION_ORDER):
+            ttk.Label(hotkey_box, text=ACTION_LABELS[action],
+                      width=14).grid(row=row, column=0, sticky="w", pady=2)
+            var = tk.StringVar()
+            self.hotkey_vars[action] = var
+            ttk.Entry(hotkey_box, textvariable=var, width=26,
+                      state="readonly").grid(row=row, column=1,
+                                             sticky="w", pady=2)
+            ttk.Button(hotkey_box, text="录制", width=8,
+                       command=lambda a=action: self._record_hotkey(a)
+                       ).grid(row=row, column=2, padx=(8, 0), pady=2)
+        ttk.Label(hotkey_box,
+                  text=f"开关：按一次静音，再按一次恢复；"
+                       f"音量键每按一次调整 {round(VOLUME_STEP * 100)}%",
+                  foreground="#777777").grid(row=len(ACTION_ORDER), column=0,
+                                             columnspan=3, sticky="w",
+                                             pady=(6, 0))
 
         # 状态
         self.status_var = tk.StringVar(value="就绪")
@@ -861,8 +900,10 @@ class App:
         self.root.geometry(f"+{x}+{y}")
 
     def _load_into_ui(self):
-        raw = str(self.cfg.get("hotkeys", {}).get("mute", "") or "")
-        self.hotkey_var.set(format_hotkey(raw) if raw else "")
+        hotkeys = self.cfg.get("hotkeys", {})
+        for action, var in self.hotkey_vars.items():
+            raw = str(hotkeys.get(action, "") or "")
+            var.set(format_hotkey(raw) if raw else "")
 
     # -- 图标 / 托盘 ------------------------------------------------------
     def _setup_icon(self):
@@ -924,8 +965,8 @@ class App:
             pass
 
     # -- 快捷键 ----------------------------------------------------------
-    def _current_hotkey(self):
-        text = self.hotkey_var.get().strip()
+    def _current_hotkey(self, action: str):
+        text = self.hotkey_vars[action].get().strip()
         if not text:
             raise ValueError("请先设置一个快捷键")
         return parse_hotkey(text)
@@ -935,11 +976,15 @@ class App:
             self.hotkeys.stop()
             self.hotkeys = None
         self._hotkey_failures = {}
-        try:
-            pair = self._current_hotkey()
-        except ValueError:
+        bindings = {}
+        for action in ACTION_ORDER:
+            try:
+                bindings[action] = self._current_hotkey(action)
+            except ValueError:
+                continue
+        if not bindings:
             return
-        thread = HotkeyThread({"mute": pair})
+        thread = HotkeyThread(bindings)
         thread.start()
         thread.ready.wait(timeout=2.0)
         self.hotkeys = thread
@@ -950,19 +995,27 @@ class App:
     def _failure_text(self) -> str:
         if not self._hotkey_failures:
             return ""
-        return ("快捷键注册失败（多半是被其他程序占用了），请换一组组合键再保存。")
+        names = "、".join(ACTION_LABELS.get(action, action)
+                          for action in self._hotkey_failures)
+        return (f"快捷键注册失败：{names}（多半是被其他程序占用了），"
+                f"请换一组组合键再保存。")
 
-    def _record_hotkey(self):
-        HotkeyRecorder(self.root, ACTION_LABELS["mute"], self.hotkey_var.get(),
-                       self._on_recorded)
+    def _record_hotkey(self, action: str):
+        HotkeyRecorder(self.root, ACTION_LABELS[action],
+                       self.hotkey_vars[action].get(),
+                       lambda text: self._on_recorded(action, text))
 
-    def _on_recorded(self, text):
-        self.hotkey_var.set(format_hotkey(text))
-        self._save_hotkey()
+    def _on_recorded(self, action: str, text):
+        self.hotkey_vars[action].set(format_hotkey(text))
+        self._save_hotkey(action)
 
     # -- 音频 ------------------------------------------------------------
     def _toggle_mute(self):
         self.audio.submit(self.audio.toggle_mute, self._on_mute_result)
+
+    def _adjust_volume(self, delta: float):
+        self.audio.submit(lambda: self.audio.adjust_volume(delta),
+                          self._on_volume_result)
 
     def _on_mute_result(self, result, error):
         if error is not None:
@@ -987,8 +1040,29 @@ class App:
             self._notify(f"已恢复声音 · {percent}% · {result.get('exe', '')}",
                          f"已恢复声音 · {percent}%")
 
+    def _on_volume_result(self, result, error):
+        if error is not None:
+            log(f"volume error: {error!r}")
+            self._notify(f"调整音量失败：{error}", "调整音量失败")
+            return
+        if not result or not result.get("ok"):
+            reason = (result or {}).get("reason")
+            if reason == "no_session":
+                exe = (result or {}).get("exe") or TARGET_EXE
+                self._notify(f"没找到 {exe} 的音频会话：引擎可能没在播放声音，"
+                             f"或者已经退出。",
+                             f"没找到 {exe} 的音频会话")
+            else:
+                self._notify("调整音量失败（未知原因）。", "调整音量失败")
+            return
+        percent = round(float(result.get("volume") or 0.0) * 100)
+        short = f"音量 {percent}%"
+        if result.get("muted"):
+            short += " · 静音中"
+        self._notify(f"{short} · {result.get('exe', '')}", short)
+
     def _notify(self, status_text: str, toast_text: str | None = None) -> None:
-        """同时更新主窗口状态栏和屏幕顶部提示。"""
+        """同时更新主窗口状态栏和屏幕底部提示。"""
         self._status(status_text)
         self.toast.show(toast_text or status_text)
 
@@ -997,6 +1071,10 @@ class App:
         log(f"hotkey: {action}")
         if action == "mute":
             self._toggle_mute()
+        elif action == "up":
+            self._adjust_volume(VOLUME_STEP)
+        elif action == "down":
+            self._adjust_volume(-VOLUME_STEP)
 
     def _tick(self):
         if not self._alive:
@@ -1041,15 +1119,30 @@ class App:
             pass
 
     # -- 保存 ------------------------------------------------------------
-    def _save_hotkey(self):
+    def _save_hotkey(self, action: str):
         """录制完快捷键后立即保存并生效，不需要再点按钮。"""
         try:
-            pair = self._current_hotkey()
+            pair = self._current_hotkey(action)
         except ValueError as exc:
             messagebox.showwarning("快捷键有误", str(exc), parent=self.root)
             return
 
-        self.cfg["hotkeys"] = {"mute": hotkey_text(pair)}
+        for other in ACTION_ORDER:
+            if other == action:
+                continue
+            try:
+                other_pair = self._current_hotkey(other)
+            except ValueError:
+                continue
+            if other_pair == pair:
+                messagebox.showwarning(
+                    "快捷键冲突",
+                    f"这组快捷键已经用在「{ACTION_LABELS[other]}」上了，"
+                    f"请换一个。",
+                    parent=self.root)
+                return
+
+        self.cfg["hotkeys"][action] = hotkey_text(pair)
         try:
             save_config(self.cfg)
         except OSError as exc:
@@ -1063,7 +1156,8 @@ class App:
             self._status(message)
             messagebox.showwarning("快捷键注册失败", message, parent=self.root)
         else:
-            self._status(f"已保存并生效：{format_hotkey(hotkey_text(pair))}")
+            self._status(f"已保存并生效：{ACTION_LABELS[action]} = "
+                         f"{format_hotkey(hotkey_text(pair))}")
 
     def _restart(self):
         """保存配置 → 启动新实例 → 退出当前实例。"""
