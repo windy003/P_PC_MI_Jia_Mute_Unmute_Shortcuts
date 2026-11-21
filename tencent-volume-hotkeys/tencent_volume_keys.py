@@ -723,6 +723,7 @@ class Toast:
             self._cancel_jobs()
             self.label.configure(text=text)
             self.win.attributes("-alpha", 1.0)
+            self._make_noactivate(self.win)   # -alpha 会重置扩展样式，重新补上
             self.win.deiconify()
             self._place()
             self.win.lift()
@@ -743,6 +744,9 @@ class Toast:
     def _build(self) -> None:
         win = tk.Toplevel(self.root)
         win.overrideredirect(True)
+        # 用 Tk 自己的 -toolwindow 属性，它会把这个样式记进 Tk 内部缓存，
+        # 之后设置 -alpha 时不会被 Tk 覆盖掉（手动 SetWindowLongW 的会被覆盖）。
+        win.attributes("-toolwindow", True)
         win.attributes("-topmost", True)
         win.configure(bg=self.BG)
         self.label = tk.Label(win, text="", font=("Microsoft YaHei UI", 12),
@@ -754,7 +758,11 @@ class Toast:
         win.withdraw()
 
     def _make_noactivate(self, win: tk.Toplevel) -> None:
-        """让提示窗口不抢输入焦点，也不出现在任务栏 / Alt+Tab 里。"""
+        """让提示窗口不抢输入焦点，也不出现在任务栏 / Alt+Tab 里。
+
+        每当对窗口设置 -alpha，Tk 都会用自己缓存的扩展样式整体重写
+        GWL_EXSTYLE，把这里手动加的位清掉，所以 show / 淡出时都要重设一次。
+        """
         try:
             hwnd = user32.GetParent(win.winfo_id()) or win.winfo_id()
             style = user32.GetWindowLongW(hwnd, self.GWL_EXSTYLE)
@@ -791,6 +799,7 @@ class Toast:
                 self.win.withdraw()
                 return
             self.win.attributes("-alpha", alpha)
+            self._make_noactivate(self.win)   # -alpha 会重置扩展样式，重新补上
             self._fade_job = self.root.after(28, self._fade_out)
         except tk.TclError:
             pass
